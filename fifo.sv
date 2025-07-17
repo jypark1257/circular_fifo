@@ -18,7 +18,6 @@ module fifo #(
     // data structure to hold fetched instructions (16 x 2) and if it is valid
     logic [1:0][15:0] fifo_buffer_q[FIFO_SIZE];
     logic [1:0] valid_q[FIFO_SIZE];
-
     // data structure to hold fetched instructions (16 x 2) and if it is valid (for internal use)
     logic [1:0][15:0] fifo_buffer_d[FIFO_SIZE];
     logic [1:0] valid_d[FIFO_SIZE];
@@ -30,21 +29,35 @@ module fifo #(
     logic [$clog2(FIFO_SIZE)-1:0] write_ptr;
     // read pointer
     logic [$clog2(FIFO_SIZE)-1:0] read_ptr;
-    
 
     // write operation (pointer increment)
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (~rst_ni) begin
             write_ptr <= '0;
         end else begin
-            if (push_en_i) begin
-                if (write_ptr == FIFO_SIZE - 1) begin
-                    write_ptr <= '0; // wrap around if at the end
-                end else begin
-                    write_ptr <= write_ptr + 1;
-                end
+            if (flush_en_i) begin
+                write_ptr <= '0;
             end else begin
-                write_ptr <= write_ptr;
+                case ({push_en_i, pop_en_i})
+                    // 2'b00: no operation, keep the same pointer value
+                    2'b01: begin
+                        // pop operation, no change to write pointer
+                        write_ptr <= write_ptr;
+                    end
+                    2'b10: begin
+                        // push operation, increment write pointer
+                        if (write_ptr == FIFO_SIZE - 1) begin
+                            write_ptr <= '0; // wrap around if at the end
+                        end else begin
+                            write_ptr <= write_ptr + 1;
+                        end
+                    end
+                    // 2'b11: direct forwarding, no change to write pointer
+                    default: begin
+                        // no operation, keep the same pointer value
+                        write_ptr <= write_ptr;
+                    end
+                endcase
             end
         end
     end
@@ -54,19 +67,32 @@ module fifo #(
         if (~rst_ni) begin
             read_ptr <= '0;
         end else begin
-            if (pop_en_i) begin
-                if (read_ptr == FIFO_SIZE - 1) begin
-                    read_ptr <= '0; // wrap around if at the end
-                end else begin
-                    // only increment if there is valid data to read
-                    read_ptr <= read_ptr + 1;
-                end
+            if (flush_en_i) begin
+                read_ptr <= '0;
             end else begin
-                read_ptr <= read_ptr;
+                case ({push_en_i, pop_en_i})
+                    // 2'b00: no operation, keep the same pointer value
+                    2'b01: begin
+                        // pop operation, increment read pointer
+                        if (read_ptr == FIFO_SIZE - 1) begin
+                            read_ptr <= '0; // wrap around if at the end
+                        end else begin
+                            read_ptr <= read_ptr + 1;
+                        end
+                    end
+                    2'b10: begin
+                        // push operation, no change to read pointer
+                        read_ptr <= read_ptr;
+                    end
+                    // 2'b11: direct forwarding, no change to read pointer
+                    default: begin
+                        // no operation, keep the same pointer value
+                        read_ptr <= read_ptr;
+                    end
+                endcase
             end
         end
     end
-
 
     // FIFO Buffer
     always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -90,38 +116,52 @@ module fifo #(
         end
     end
 
-    // write fetched instruction into the buffer
+    // flush, read, and write operations
     always @(*) begin
+        data_d = '0; // default value for data_d
         for (int i = 0; i < FIFO_SIZE; i++) begin
-            fifo_buffer_d[i] = fifo_buffer_q[i]; // default to hold previous value
-            valid_d[i] = valid_q[i]; // default to hold previous validity
+            fifo_buffer_d[i] = fifo_buffer_q[i];
+            valid_d[i] = valid_q[i];
         end
-        if (push_en_i) begin
-            fifo_buffer_d[write_ptr][0] = data_i[(XLEN/2)-1:0];
-            fifo_buffer_d[write_ptr][1] = data_i[XLEN-1:(XLEN/2)];
-            valid_d[write_ptr] = 2'b11; // mark both halves as valid
-        end else begin
+        if (flush_en_i) begin
             for (int i = 0; i < FIFO_SIZE; i++) begin
-                fifo_buffer_d[i] = fifo_buffer_q[i]; // default to hold previous value
-                valid_d[i] = valid_q[i]; // default to hold previous validity
+                fifo_buffer_d[i] = '0;
+                valid_d[i] = '0;
             end
-        end
-    end
-
-    // read instruction from the buffer
-    always @(*) begin
-        data_d = data_q; // default to hold previous value
-        for (int i = 0; i < FIFO_SIZE; i++) begin
-            valid_d[i] = valid_q[i]; // default to hold previous validity
-        end
-        if (pop_en_i && (valid_q[read_ptr] != 2'b00)) begin
-            data_d = {fifo_buffer_q[read_ptr][1], fifo_buffer_q[read_ptr][0]};
-            valid_d[read_ptr] = 2'b00; // mark as invalid after reading
         end else begin
-            data_d = data_q; 
+            case ({push_en_i, pop_en_i})
+                // 2;b00: no operation, keep the same buffer values
+                2'b01: begin
+                    if (!empty_o) begin
+                        // pop operation, read from the FIFO
+                        data_d = {fifo_buffer_q[read_ptr][1], fifo_buffer_q[read_ptr][0]};
+                        // mark the read entry as invalid
+                        valid_d[read_ptr][1] = '0;
+                        valid_d[read_ptr][0] = '0;
+                    end
+                end
+                2'b10: begin
+                    if (!full_o) begin
+                        // push operation, write to the FIFO
+                        fifo_buffer_d[write_ptr][1] = data_i[XLEN-1:16];
+                        fifo_buffer_d[write_ptr][0] = data_i[15:0];
+                        // mark the written entry as valid
+                        valid_d[write_ptr][1] = 1'b1;
+                        valid_d[write_ptr][0] = 1'b1;
+                    end
+                end
+                2'b11: begin
+                    data_d = data_i; // direct forwarding
+                end
+                default: begin
+                    for (int i = 0; i < FIFO_SIZE; i++) begin
+                        fifo_buffer_d[i] = fifo_buffer_q[i];
+                        valid_d[i] = valid_q[i];
+                    end
+                end
+            endcase
         end
     end
-
     // data_q register
     // update data_q with the read value
     always_ff @(posedge clk_i or negedge rst_ni) begin
